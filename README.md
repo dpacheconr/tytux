@@ -51,5 +51,7 @@ python3 client.py
 
 ## Example prompts
 
-- going forward for each prompt, always inspect schema when nrql query is not provided and use account id YOUR_ACCOUNT_ID_HERE
-- get all alerts using nrqlconditionssearch, include total count,nrqlcondition nrql query and id in the results, then suggest possible improvements, like adding where clauses to each nrql where appropriate
+- First we ask Gemini to use our account id for ongoing queries and to also inspect the nerdgraph api schema when we don't provide the query to run in the prompt 
+  - going forward for each prompt, always inspect schema when nrql query is not provided and use account id YOUR_ACCOUNT_ID_HERE
+- Then let's get all the alerts on our account and ask for some suggestions how to improve them 
+  - get all alerts using nrqlconditionssearch, include total count,nrqlcondition nrql query and id in the results, then suggest possible improvements, like adding where clauses to each nrql where appropriate
