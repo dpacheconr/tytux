@@ -1,0 +1,4 @@
+asyncio
+google-genai
+python-dotenv
+mcp
