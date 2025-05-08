@@ -32,6 +32,8 @@ class MCPGeminiAgent:
             "Content-Type": "application/json"
         }
         endpoint = os.getenv("NEW_RELIC_API_ENDPOINT", "https://api.newrelic.com/graphql")
+        mutations = os.getenv("ALLOW_MUTATIONS", "false").lower() 
+         
         mcp_config= {
             "mcpServers": {
                 "graphql": {
@@ -40,7 +42,8 @@ class MCPGeminiAgent:
                 "env": {
                             "ENDPOINT": endpoint,
                             "HEADERS": json.dumps(headers),
-                            "NODE_OPTIONS": "--disable-warning=ExperimentalWarning"
+                            "NODE_OPTIONS": "--disable-warning=ExperimentalWarning",
+                            "ALLOW_MUTATIONS": str(mutations)
                         }
                 }
             }
