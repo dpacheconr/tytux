@@ -17,6 +17,7 @@ TyTuX is an interactive assistant powered by **MCP** and **Gemini AI**. It enabl
 ## 📋 Requirements
 - 🐍 **Python**: Version 3.12 or higher
 - 🟢 **Node.js**: With `npx` installed
+- 🤖 [Your Gemini API key]([https://ai.google.dev/gemini-api/docs](https://aistudio.google.com/apikey))
 - 🔑 A `.env` file with the following environment variables:
   - `GEMINI_API_KEY`: [Your Gemini API key]([https://ai.google.dev/gemini-api/docs](https://aistudio.google.com/apikey))
   - `NEW_RELIC_USER_API_KEY`: Your New Relic User API key.
