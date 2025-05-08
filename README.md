@@ -51,5 +51,5 @@ python3 client.py
 
 ## Example prompts
 
-> going forward for each prompt, always inspect schema when nrql query is not provided and use account id YOUR_ACCOUNT_ID_HERE
-> get all alerts using nrqlconditionssearch, include total count,nrqlcondition nrql query and id in the results, then suggest possible improvements, like adding where clauses to each nrql where appropriate
+- going forward for each prompt, always inspect schema when nrql query is not provided and use account id YOUR_ACCOUNT_ID_HERE
+- get all alerts using nrqlconditionssearch, include total count,nrqlcondition nrql query and id in the results, then suggest possible improvements, like adding where clauses to each nrql where appropriate
