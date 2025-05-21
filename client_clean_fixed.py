@@ -1,6 +1,7 @@
 import asyncio
 import json
 import os
+import time
 from typing import List, Optional
 from contextlib import AsyncExitStack
 import warnings
@@ -11,7 +12,6 @@ from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from dotenv import load_dotenv
 import subprocess
-import streamlit as st
 
 print("Loading environment variables from .env file")
 dotenv_path = os.path.join(os.path.dirname(__file__), '.env')
@@ -51,56 +51,93 @@ class MCPGeminiAgent:
         self.contents.append(types.Content(role="model", parts=[types.Part(text=f"I'll use account ID {account_id} for queries and use NerdGraph API schema to build a query when no specific query is provided.")]))
 
     async def connect(self):
-        headers = {
-            "API-Key": os.getenv("NEW_RELIC_USER_API_KEY"),
-            "Content-Type": "application/json"
-        }
-        endpoint = os.getenv("NEW_RELIC_API_ENDPOINT", "https://api.newrelic.com/graphql")
-        mutations = os.getenv("ALLOW_MUTATIONS", "false").lower() 
-         
-        mcp_config= {
-            "mcpServers": {
-                "graphql": {
-                "command": "npx",
-                "args": ["mcp-graphql"],
-                "env": {
-                            "ENDPOINT": endpoint,
-                            "HEADERS": json.dumps(headers),
-                            "NODE_OPTIONS": "--disable-warning=ExperimentalWarning",
-                            "ALLOW_MUTATIONS": str(mutations)
-                        }
+        """Connect to the MCP server with timeout handling"""
+        try:
+            headers = {
+                "API-Key": os.getenv("NEW_RELIC_USER_API_KEY"),
+                "Content-Type": "application/json"
+            }
+            endpoint = os.getenv("NEW_RELIC_API_ENDPOINT", "https://api.newrelic.com/graphql")
+            mutations = os.getenv("ALLOW_MUTATIONS", "false").lower() 
+             
+            mcp_config= {
+                "mcpServers": {
+                    "graphql": {
+                    "command": "npx",
+                    "args": ["mcp-graphql"],
+                    "env": {
+                                "ENDPOINT": endpoint,
+                                "HEADERS": json.dumps(headers),
+                                "NODE_OPTIONS": "--disable-warning=ExperimentalWarning",
+                                "ALLOW_MUTATIONS": str(mutations)
+                            }
+                    }
                 }
             }
-        }
-        
-        servers = mcp_config['mcpServers']
-        server_name, server_cfg = next(iter(servers.items()))  # Automatically select the first server
-        self.server_name = server_name
-        command = server_cfg['command']
-        args = server_cfg.get('args', [])
-        env = server_cfg.get('env', None)
-        self.server_params = StdioServerParameters(
-            command=command,
-            args=args,
-            env=env
-        )
-        
-        self.stdio_transport = await self.exit_stack.enter_async_context(stdio_client(self.server_params))
-        self.stdio, self.write = self.stdio_transport
-        self.session = await self.exit_stack.enter_async_context(ClientSession(self.stdio, self.write))
-        await self.session.initialize()
-        print(f"Successfully connected to: {self.server_name}")
+            
+            servers = mcp_config['mcpServers']
+            server_name, server_cfg = next(iter(servers.items()))  # Automatically select the first server
+            self.server_name = server_name
+            command = server_cfg['command']
+            args = server_cfg.get('args', [])
+            env = server_cfg.get('env', None)
+            self.server_params = StdioServerParameters(
+                command=command,
+                args=args,
+                env=env
+            )
+            
+            # Use asyncio.wait_for to add timeout handling
+            try:
+                self.stdio_transport = await asyncio.wait_for(
+                    self.exit_stack.enter_async_context(stdio_client(self.server_params)),
+                    timeout=10.0  # 10 second timeout
+                )
+                
+                self.stdio, self.write = self.stdio_transport
+                
+                self.session = await asyncio.wait_for(
+                    self.exit_stack.enter_async_context(ClientSession(self.stdio, self.write)),
+                    timeout=10.0  # 10 second timeout
+                )
+                
+                await asyncio.wait_for(
+                    self.session.initialize(),
+                    timeout=10.0  # 10 second timeout
+                )
+                
+                print(f"Successfully connected to: {self.server_name}")
+                
+            except asyncio.TimeoutError:
+                print(f"Timeout connecting to MCP server: {self.server_name}")
+                raise TimeoutError(f"Connection to {self.server_name} timed out")
+                
+        except Exception as e:
+            print(f"Error establishing connection: {type(e).__name__}: {e}")
+            raise
 
     async def agent_loop(self, prompt: str) -> str:
-        # Add debugging to identify and fix the None return issue
+        """Process a user query with enhanced timeout handling"""
+        start_time = time.time()
         print(f"Agent loop started with prompt: {prompt[:50]}...")
         
         # Add the user's prompt to the conversation
         self.contents.append(types.Content(role="user", parts=[types.Part(text=prompt)]))
         
-        # List available tools for this server
+        # List available tools for this server with timeout handling
         print("Fetching available tools...")
-        mcp_tools = await self.session.list_tools()
+        try:
+            mcp_tools = await asyncio.wait_for(
+                self.session.list_tools(),
+                timeout=15.0  # 15 second timeout
+            )
+        except asyncio.TimeoutError:
+            print("Fetching tools timed out!")
+            raise TimeoutError("Fetching tools from MCP server timed out")
+        except Exception as e:
+            print(f"Error fetching tools: {type(e).__name__}: {e}")
+            raise
+            
         tools = types.Tool(function_declarations=[
             {
                 "name": tool.name,
@@ -109,6 +146,7 @@ class MCPGeminiAgent:
             for tool in mcp_tools.tools
         ])
         self.tools = tools
+        print(f"Successfully fetched {len(mcp_tools.tools)} tools")
 
         # Generate a response from Gemini with enhanced error handling
         print("Generating initial response from Gemini...")
@@ -122,15 +160,18 @@ class MCPGeminiAgent:
             # Log model being used
             print(f"Using Gemini model: {self.model}")
             
-            # Attempt to generate content with detailed logging
+            # Attempt to generate content with detailed logging and timeout
             try:
-                response = await self.genai_client.aio.models.generate_content(
-                    model=self.model,
-                    contents=self.contents,
-                    config=types.GenerateContentConfig(
-                        temperature=0,
-                        tools=[tools],
+                response = await asyncio.wait_for(
+                    self.genai_client.aio.models.generate_content(
+                        model=self.model,
+                        contents=self.contents,
+                        config=types.GenerateContentConfig(
+                            temperature=0,
+                            tools=[tools],
+                        ),
                     ),
+                    timeout=30.0  # 30 second timeout for initial response
                 )
                 print(f"Initial response received, type: {type(response)}")
                 
@@ -142,6 +183,9 @@ class MCPGeminiAgent:
                 # Add the response to conversation history
                 self.contents.append(response.candidates[0].content)
                 
+            except asyncio.TimeoutError:
+                print("ERROR: Gemini API request timed out")
+                raise TimeoutError("Gemini API request timed out")
             except Exception as api_error:
                 print(f"ERROR during Gemini API call: {type(api_error).__name__}: {str(api_error)}")
                 raise api_error
@@ -159,49 +203,80 @@ class MCPGeminiAgent:
         max_tool_turns = 5
         while response.function_calls and turn_count < max_tool_turns:
             turn_count += 1
+            print(f"Tool turn {turn_count}/{max_tool_turns}")
             tool_response_parts: List[types.Part] = []
+            
             for fc_part in response.function_calls:
                 tool_name = fc_part.name
                 args = fc_part.args or {}
                 print(f"Invoking MCP tool '{tool_name}' with arguments: {args}")
                 tool_response: dict
                 try:
-                    tool_result = await self.session.call_tool(tool_name, args)
-                    print(f"Tool '{tool_name}' executed.")
+                    # Add timeout handling for tool calls
+                    tool_result = await asyncio.wait_for(
+                        self.session.call_tool(tool_name, args),
+                        timeout=20.0  # 20 second timeout per tool call
+                    )
+                    print(f"Tool '{tool_name}' executed successfully")
                     if tool_result.isError:
                         tool_response = {"error": tool_result.content[0].text}
                     else:
                         tool_response = {"result": tool_result.content[0].text}
+                except asyncio.TimeoutError:
+                    print(f"Tool '{tool_name}' execution timed out")
+                    tool_response = {"error": f"Tool execution timed out after 20 seconds"}
                 except Exception as e:
-                    tool_response = {"error":  f"Tool execution failed: {type(e).__name__}: {e}"}
+                    print(f"Tool '{tool_name}' execution failed: {type(e).__name__}: {e}")
+                    tool_response = {"error": f"Tool execution failed: {type(e).__name__}: {e}"}
+                    
                 tool_response_parts.append(
                     types.Part.from_function_response(
                         name=tool_name, response=tool_response
                     )
                 )
+                
             self.contents.append(types.Content(role="user", parts=tool_response_parts))  # Add tool responses
             print(f"Added {len(tool_response_parts)} tool response(s) to the conversation.")
             print("Requesting updated response from Gemini...")
             try:
-                response = await self.genai_client.aio.models.generate_content(
-                    model=self.model,
-                    contents=self.contents,
-                    config=types.GenerateContentConfig(
-                        temperature=1.0,
-                        tools=[tools],
+                # Add timeout handling for updated responses
+                response = await asyncio.wait_for(
+                    self.genai_client.aio.models.generate_content(
+                        model=self.model,
+                        contents=self.contents,
+                        config=types.GenerateContentConfig(
+                            temperature=1.0,
+                            tools=[tools],
+                        ),
                     ),
+                    timeout=20.0  # 20 second timeout for updated responses
                 )
                 print("Updated response received successfully")
                 if hasattr(response, 'candidates') and response.candidates:
                     self.contents.append(response.candidates[0].content)  # Add updated Gemini response
                 else:
                     print("WARNING: Updated response missing candidates")
+            except asyncio.TimeoutError:
+                print("ERROR: Updated Gemini response timed out")
+                # Create a simple object to handle the timeout and continue the loop
+                class TimeoutResponse:
+                    def __init__(self):
+                        self.text = "Request timed out. Please try again."
+                        self.candidates = []
+                        self.function_calls = []  # Break the loop
+                response = TimeoutResponse()
+                break
             except Exception as update_error:
                 print(f"ERROR during updated response: {str(update_error)}")
                 # Continue with last valid response
+                break
+                
         if turn_count >= max_tool_turns and response.function_calls:
             print(f"Stopped after {max_tool_turns} tool calls to avoid infinite loops.")
-        print("All tool calls complete. Displaying Gemini's final response.")
+        
+        end_time = time.time()
+        elapsed_time = end_time - start_time
+        print(f"All tool calls complete. Displaying Gemini's final response. Elapsed time: {elapsed_time:.2f}s")
         
         # Structure the response to include the text directly
         print("Final response processing...")
@@ -268,7 +343,19 @@ class MCPGeminiAgent:
                 print(f"\nAn error occurred: {str(e)}")
 
     async def cleanup(self):
-        await self.exit_stack.aclose()
+        """Clean up resources with timeout handling"""
+        print("Cleaning up resources...")
+        try:
+            # Use a shorter timeout for cleanup operations
+            await asyncio.wait_for(
+                self.exit_stack.aclose(),
+                timeout=5.0  # 5 second timeout
+            )
+            print("Cleanup completed successfully")
+        except asyncio.TimeoutError:
+            print("WARNING: Cleanup timed out, some resources may not be properly released")
+        except Exception as e:
+            print(f"ERROR during cleanup: {type(e).__name__}: {e}")
 
 async def main():
     agent = MCPGeminiAgent()
@@ -291,58 +378,17 @@ def is_npx_installed():
         print(f"Error while checking npx: {e.stderr}")
         return False
 
-def run_streamlit_agent():
-    import asyncio
-    import threading
-    import queue
-
-    st.set_page_config(page_title="TyTuX UI", page_icon="🤖")
-    st.title("🤖 TyTuX - Command Your Data")
-    st.markdown("""
-    Welcome to TyTuX! This is a very basic UI to interact with your assistant.
-    - Enter your prompt below and click **Send** to interact with the backend.
-    """)
-
-    if 'agent' not in st.session_state:
-        st.session_state.agent = MCPGeminiAgent()
-        st.session_state.connected = False
-        st.session_state.loop = asyncio.new_event_loop()
-        st.session_state.response = ""
-
-    user_input = st.text_area("Your prompt:", height=100)
-    send = st.button("Send")
-
-    if send and user_input.strip():
-        if not st.session_state.connected:
-            with st.spinner("Connecting to backend..."):
-                st.session_state.loop.run_until_complete(st.session_state.agent.connect())
-                st.session_state.connected = True
-        with st.spinner("Processing..."):
-            response = st.session_state.loop.run_until_complete(
-                st.session_state.agent.agent_loop(user_input)
-            )
-            # Try to get text from Gemini's response
-            try:
-                st.session_state.response = response.text
-            except Exception:
-                st.session_state.response = str(response)
-    if st.session_state.response:
-        st.markdown(f"**Gemini's answer:**\n\n{st.session_state.response}")
-
+# Run the CLI interface
 if __name__ == "__main__":
-    import sys
-    import os
-    if len(sys.argv) > 1 and sys.argv[1] == "ui":
-        run_streamlit_agent()
+    print("TyTuX - Command your data")
+    if is_npx_installed():
+        pass
     else:
-        print("TyTuX - Command your data")
-        if is_npx_installed():
-            pass
-        else:
-            print("Please install npx (Node.js) to proceed.")
-        try:
-            asyncio.run(main())
-        except KeyboardInterrupt:
-            print("Session interrupted. Goodbye!")
-        finally:
-            sys.stderr = open(os.devnull, "w")
+        print("Please install npx (Node.js) to proceed.")
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("Session interrupted. Goodbye!")
+    finally:
+        import sys
+        sys.stderr = open(os.devnull, "w")

@@ -2,4 +2,5 @@ asyncio
 google-genai
 python-dotenv
 mcp
+flask
 streamlit
