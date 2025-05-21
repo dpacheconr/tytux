@@ -11,9 +11,26 @@ from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from dotenv import load_dotenv
 import subprocess
+import streamlit as st
 
-load_dotenv()
+print("Loading environment variables from .env file")
+dotenv_path = os.path.join(os.path.dirname(__file__), '.env')
+if os.path.exists(dotenv_path):
+    print(f".env file found at {dotenv_path}")
+    # Load with verbose output
+    load_dotenv(dotenv_path=dotenv_path, verbose=True)
+else:
+    print(f"WARNING: .env file not found at {dotenv_path}")
+    load_dotenv()
+    
 warnings.filterwarnings("ignore", category=ResourceWarning)
+
+# Check for required environment variables
+required_vars = ["GEMINI_API_KEY", "NEW_RELIC_USER_API_KEY", "NEW_RELIC_ACCOUNT_ID"]
+missing_vars = [var for var in required_vars if not os.getenv(var)]
+if missing_vars:
+    print(f"ERROR: Missing required environment variables: {', '.join(missing_vars)}")
+    print("Please ensure these are set in your .env file or environment")
 
 class MCPGeminiAgent:
     def __init__(self):
@@ -24,7 +41,14 @@ class MCPGeminiAgent:
         self.tools = None
         self.server_params = None
         self.server_name = None
-        self.contents = []  # Initialize conversation history for Gemini
+        
+        # Initialize conversation with a default context
+        account_id = os.getenv("NEW_RELIC_ACCOUNT_ID")
+        initial_prompt = f"Use account ID {account_id} for ongoing queries. Inspect the NerdGraph API schema, keep it in memory and when no query is provided use the schema to build a query."
+        self.contents = [types.Content(role="user", parts=[types.Part(text=initial_prompt)])]
+        
+        # Create a dummy response to add to history
+        self.contents.append(types.Content(role="model", parts=[types.Part(text=f"I'll use account ID {account_id} for queries and use NerdGraph API schema to build a query when no specific query is provided.")]))
 
     async def connect(self):
         headers = {
@@ -68,10 +92,14 @@ class MCPGeminiAgent:
         print(f"Successfully connected to: {self.server_name}")
 
     async def agent_loop(self, prompt: str) -> str:
+        # Add debugging to identify and fix the None return issue
+        print(f"Agent loop started with prompt: {prompt[:50]}...")
+        
         # Add the user's prompt to the conversation
         self.contents.append(types.Content(role="user", parts=[types.Part(text=prompt)]))
         
         # List available tools for this server
+        print("Fetching available tools...")
         mcp_tools = await self.session.list_tools()
         tools = types.Tool(function_declarations=[
             {
@@ -82,16 +110,50 @@ class MCPGeminiAgent:
         ])
         self.tools = tools
 
-        # Generate a response from Gemini
-        response = await self.genai_client.aio.models.generate_content(
-            model=self.model,
-            contents=self.contents,
-            config=types.GenerateContentConfig(
-                temperature=0,
-                tools=[tools],
-            ),
-        )
-        self.contents.append(response.candidates[0].content)  # Add Gemini's response to the conversation
+        # Generate a response from Gemini with enhanced error handling
+        print("Generating initial response from Gemini...")
+        try:
+            # Verify API key is available
+            api_key = os.getenv("GEMINI_API_KEY")
+            if not api_key:
+                print("ERROR: GEMINI_API_KEY environment variable is not set")
+                raise ValueError("Gemini API key is missing. Please set the GEMINI_API_KEY environment variable.")
+                
+            # Log model being used
+            print(f"Using Gemini model: {self.model}")
+            
+            # Attempt to generate content with detailed logging
+            try:
+                response = await self.genai_client.aio.models.generate_content(
+                    model=self.model,
+                    contents=self.contents,
+                    config=types.GenerateContentConfig(
+                        temperature=0,
+                        tools=[tools],
+                    ),
+                )
+                print(f"Initial response received, type: {type(response)}")
+                
+                # Verify response has expected structure
+                if not hasattr(response, 'candidates') or not response.candidates:
+                    print("WARNING: Response missing candidates")
+                    raise ValueError("Gemini response missing expected 'candidates' attribute")
+                    
+                # Add the response to conversation history
+                self.contents.append(response.candidates[0].content)
+                
+            except Exception as api_error:
+                print(f"ERROR during Gemini API call: {type(api_error).__name__}: {str(api_error)}")
+                raise api_error
+                
+        except Exception as e:
+            print(f"ERROR: Failed to generate content from Gemini: {str(e)}")
+            # Create a minimal response object to avoid returning None
+            class SimpleResponse:
+                def __init__(self, error_message):
+                    self.text = error_message
+                    self.function_calls = []
+            return SimpleResponse(f"Error calling Gemini API: {str(e)}")
 
         turn_count = 0
         max_tool_turns = 5
@@ -120,19 +182,71 @@ class MCPGeminiAgent:
             self.contents.append(types.Content(role="user", parts=tool_response_parts))  # Add tool responses
             print(f"Added {len(tool_response_parts)} tool response(s) to the conversation.")
             print("Requesting updated response from Gemini...")
-            response = await self.genai_client.aio.models.generate_content(
-                model=self.model,
-                contents=self.contents,
-                config=types.GenerateContentConfig(
-                    temperature=1.0,
-                    tools=[tools],
-                ),
-            )
-            self.contents.append(response.candidates[0].content)  # Add updated Gemini response
+            try:
+                response = await self.genai_client.aio.models.generate_content(
+                    model=self.model,
+                    contents=self.contents,
+                    config=types.GenerateContentConfig(
+                        temperature=1.0,
+                        tools=[tools],
+                    ),
+                )
+                print("Updated response received successfully")
+                if hasattr(response, 'candidates') and response.candidates:
+                    self.contents.append(response.candidates[0].content)  # Add updated Gemini response
+                else:
+                    print("WARNING: Updated response missing candidates")
+            except Exception as update_error:
+                print(f"ERROR during updated response: {str(update_error)}")
+                # Continue with last valid response
         if turn_count >= max_tool_turns and response.function_calls:
             print(f"Stopped after {max_tool_turns} tool calls to avoid infinite loops.")
         print("All tool calls complete. Displaying Gemini's final response.")
-        return response
+        
+        # Structure the response to include the text directly
+        print("Final response processing...")
+        try:
+            # Add a text property to make it easier for the UI to extract the content
+            # Defensive programming - create a fallback if response is None somehow
+            if response is None:
+                print("WARNING: Response is None in final processing")
+                class EmptyResponse:
+                    def __init__(self):
+                        self.candidates = []
+                        self.function_calls = []
+                response = EmptyResponse()
+                response_obj = response
+                response_text = "I didn't receive a proper response. Please try again."
+            else:
+                response_obj = response
+                try:
+                    if hasattr(response, 'candidates') and response.candidates:
+                        response_text = response.candidates[0].content.text
+                    else:
+                        print("WARNING: Response missing expected structure")
+                        response_text = "I received an incomplete response. Please try again."
+                    print(f"Successfully extracted response text: {response_text[:50]}...")
+                except Exception as e:
+                    print(f"Error extracting text from response: {e}")
+                    response_text = "I encountered an error processing the response. Please try again."
+            
+            # Set the text property - this is what the UI looks for
+            setattr(response_obj, 'text', response_text)
+            print("Final response object prepared with text property")
+            return response_obj
+            
+        except Exception as final_e:
+            print(f"ERROR in final response preparation: {str(final_e)}")
+            # Always return something usable
+            class FallbackResponse:
+                def __init__(self, message):
+                    self.text = message
+                    self.candidates = []
+                    self.function_calls = []
+            
+            fallback = FallbackResponse(f"I encountered an error: {str(final_e)}. Please try again.")
+            print("Returning fallback response object")
+            return fallback
 
     async def chat(self):
         print(f"\nMCP-Gemini Assistant is ready and connected to: {self.server_name}")
@@ -177,17 +291,58 @@ def is_npx_installed():
         print(f"Error while checking npx: {e.stderr}")
         return False
 
+def run_streamlit_agent():
+    import asyncio
+    import threading
+    import queue
+
+    st.set_page_config(page_title="TyTuX UI", page_icon="🤖")
+    st.title("🤖 TyTuX - Command Your Data")
+    st.markdown("""
+    Welcome to TyTuX! This is a very basic UI to interact with your assistant.
+    - Enter your prompt below and click **Send** to interact with the backend.
+    """)
+
+    if 'agent' not in st.session_state:
+        st.session_state.agent = MCPGeminiAgent()
+        st.session_state.connected = False
+        st.session_state.loop = asyncio.new_event_loop()
+        st.session_state.response = ""
+
+    user_input = st.text_area("Your prompt:", height=100)
+    send = st.button("Send")
+
+    if send and user_input.strip():
+        if not st.session_state.connected:
+            with st.spinner("Connecting to backend..."):
+                st.session_state.loop.run_until_complete(st.session_state.agent.connect())
+                st.session_state.connected = True
+        with st.spinner("Processing..."):
+            response = st.session_state.loop.run_until_complete(
+                st.session_state.agent.agent_loop(user_input)
+            )
+            # Try to get text from Gemini's response
+            try:
+                st.session_state.response = response.text
+            except Exception:
+                st.session_state.response = str(response)
+    if st.session_state.response:
+        st.markdown(f"**Gemini's answer:**\n\n{st.session_state.response}")
+
 if __name__ == "__main__":
     import sys
     import os
-    print("TyTuX - Command your data")
-    if is_npx_installed():
-        pass
+    if len(sys.argv) > 1 and sys.argv[1] == "ui":
+        run_streamlit_agent()
     else:
-        print("Please install npx (Node.js) to proceed.")
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        print("Session interrupted. Goodbye!")
-    finally:
-        sys.stderr = open(os.devnull, "w")
+        print("TyTuX - Command your data")
+        if is_npx_installed():
+            pass
+        else:
+            print("Please install npx (Node.js) to proceed.")
+        try:
+            asyncio.run(main())
+        except KeyboardInterrupt:
+            print("Session interrupted. Goodbye!")
+        finally:
+            sys.stderr = open(os.devnull, "w")
