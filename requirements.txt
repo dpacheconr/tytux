@@ -1,4 +1,10 @@
+# TyTuX requirements
+# Core dependencies
 asyncio
-google-genai
-python-dotenv
-mcp
+google-genai>=0.2.0
+python-dotenv>=1.0.0
+requests>=2.28.0
+
+# Web interface dependencies
+quart>=0.18.0
+hypercorn>=0.14.0
